@@ -1,7 +1,7 @@
 # Edge CDP Injector
 
 A security research tool for enabling Chrome DevTools Protocol (CDP) debugging on Microsoft Edge browser processes at runtime. This project demonstrates advanced Windows API usage, PE file analysis, and dynamic code manipulation techniques.
-
+For details on how it was built check out [my blog](https://deathflamingo.com/blog/cdp_enabler/)
 ## Overview
 
 This tool injects a DLL into Microsoft Edge to enable Chrome DevTools Protocol debugging capabilities without requiring command-line flags or browser restarts. It uses signature-based symbol resolution to locate required functions within Edge's internal libraries, avoiding the need for PDB files.
