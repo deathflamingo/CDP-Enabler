@@ -142,7 +142,7 @@ While the signatures should be version resilient for the most part, if the injec
 You will need to find patterns for these symbols:
 
 1. `TCPServerSocketFactory` - vtable in .rdata section
-2. `operator new` - Chrome's allocator (appears multiple times)
+2. `operator new` - Chrome's allocator (appears multiple times, so use `*??2@YAPEAX_K@Z*` )
 3. `content::DevToolsAgentHost::StartRemoteDebuggingServer` - main CDP function
 4. `content::DevToolsManager::GetInstance` - singleton accessor
 
@@ -154,7 +154,7 @@ You will need to find patterns for these symbols:
 2. Use the provided `pe_signature_finder.py` script:
 
 ```batch
-python pe_signature_finder.py --pdb msedge.pdb --symbol "DevToolsAgentHost::StartRemoteDebuggingServer"
+python pe_signature_finder.py --pdb msedge.pdb --symbol "*DevToolsAgentHost::StartRemoteDebuggingServer*"
 ```
 
 3. The script will output minimal unique byte patterns
