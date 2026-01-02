@@ -1,12 +1,17 @@
 /*
- * DLL Injector for Edge CDP Enabler
- * Finds Edge browser process and injects the CDP DLL.
+ * DLL Injector for Edge/Chrome CDP Enabler
+ * Finds browser process and injects the CDP DLL.
  * For security research purposes only.
  *
  * Build (x64): cl /O2 injector.c /Fe:injector.exe advapi32.lib user32.lib
  */
 
 #define WIN32_LEAN_AND_MEAN
+
+/* Target configuration - change these to switch between Edge and Chrome */
+#define TARGET_PROC_NAME L"chrome.exe"    /* L"chrome.exe" for Chrome */
+#define TARGET_PROC_DISPLAY "Chrome"         /* "Chrome" for Chrome */
+
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -41,8 +46,8 @@ static BOOL IsBrowserProcess(DWORD pid) {
     return result;
 }
 
-/* Find Edge browser process */
-static DWORD FindEdgeBrowserProcess(void) {
+/* Find browser process */
+static DWORD FindBrowserProcess(void) {
     HANDLE hSnapshot;
     PROCESSENTRY32W pe = {0};
     DWORD browser_pid = 0;
@@ -57,9 +62,9 @@ static DWORD FindEdgeBrowserProcess(void) {
 
     if (Process32FirstW(hSnapshot, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"msedge.exe") == 0) {
+            if (_wcsicmp(pe.szExeFile, TARGET_PROC_NAME) == 0) {
                 if (IsBrowserProcess(pe.th32ProcessID)) {
-                    printf("[+] Found Edge browser process: PID %lu\n", pe.th32ProcessID);
+                    printf("[+] Found %s browser process: PID %lu\n", TARGET_PROC_DISPLAY, pe.th32ProcessID);
                     browser_pid = pe.th32ProcessID;
                     break;
                 }
@@ -178,7 +183,7 @@ int main(int argc, char* argv[]) {
     char dll_path[MAX_PATH] = {0};
     DWORD target_pid = 0;
 
-    printf("=== Edge CDP Injector ===\n\n");
+    printf("=== %s CDP Injector ===\n\n", TARGET_PROC_DISPLAY);
 
     /* Get DLL path */
     if (argc >= 2) {
@@ -212,10 +217,10 @@ int main(int argc, char* argv[]) {
         target_pid = (DWORD)atoi(argv[2]);
         printf("[*] Using specified PID: %lu\n", target_pid);
     } else {
-        printf("[*] Searching for Edge browser process...\n");
-        target_pid = FindEdgeBrowserProcess();
+        printf("[*] Searching for %s browser process...\n", TARGET_PROC_DISPLAY);
+        target_pid = FindBrowserProcess();
         if (!target_pid) {
-            printf("[-] Edge browser process not found. Is Edge running?\n");
+            printf("[-] %s browser process not found. Is %s running?\n", TARGET_PROC_DISPLAY, TARGET_PROC_DISPLAY);
             return 1;
         }
     }

