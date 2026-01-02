@@ -1,7 +1,7 @@
 # Edge CDP Injector
 
 A security research tool for enabling Chrome DevTools Protocol (CDP) debugging on Microsoft Edge browser processes at runtime. This project demonstrates advanced Windows API usage, PE file analysis, and dynamic code manipulation techniques.
-
+For details on how it was built check out [my blog](https://deathflamingo.com/blog/cdp_enabler/)
 ## Overview
 
 This tool injects a DLL into Microsoft Edge to enable Chrome DevTools Protocol debugging capabilities without requiring command-line flags or browser restarts. It uses signature-based symbol resolution to locate required functions within Edge's internal libraries, avoiding the need for PDB files.
@@ -142,7 +142,7 @@ While the signatures should be version resilient for the most part, if the injec
 You will need to find patterns for these symbols:
 
 1. `TCPServerSocketFactory` - vtable in .rdata section
-2. `operator new` - Chrome's allocator (appears multiple times)
+2. `operator new` - Chrome's allocator (appears multiple times, so use `*??2@YAPEAX_K@Z*` )
 3. `content::DevToolsAgentHost::StartRemoteDebuggingServer` - main CDP function
 4. `content::DevToolsManager::GetInstance` - singleton accessor
 
@@ -154,7 +154,7 @@ You will need to find patterns for these symbols:
 2. Use the provided `pe_signature_finder.py` script:
 
 ```batch
-python pe_signature_finder.py --pdb msedge.pdb --symbol "DevToolsAgentHost::StartRemoteDebuggingServer"
+python pe_signature_finder.py --pdb msedge.pdb --symbol "*DevToolsAgentHost::StartRemoteDebuggingServer*"
 ```
 
 3. The script will output minimal unique byte patterns
